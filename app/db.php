@@ -1,10 +1,13 @@
 <?php
-// /app/db.php
-
 require_once __DIR__ . '/config.php';
 
 try {
-    $dsn = "pgsql:host=" . DB_HOST . ";dbname=" . DB_NAME;
+    if (DB_DRIVER === 'pgsql') {
+        $dsn = "pgsql:host=" . DB_HOST . ";dbname=" . DB_NAME;
+    } else {
+        $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
+    }
+
     $options = [
         PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
