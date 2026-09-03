@@ -1,0 +1,42 @@
+# Environments
+venv/
+ai_service/venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+.env.*.local
+
+# IDEs and Tools
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Uvicorn/Python
+*.egg-info/
+dist/
+build/
+
+# Node (if used)
+node_modules/
+
+# Secrets (CRITICAL: Do not upload!)
+*.pem
+*.key
+credentials.json
+
+# EmoLink specific
+ai_service/__pycache__/
+public/uploads/
+
+# Deployment folders
+deploy_frontend/
+emolink_frontend.zip
+EmoLink-main/

@@ -1,0 +1,401 @@
+import os
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List
+import uvicorn
+
+import db
+import context_builder
+import gemini_client
+
+app = FastAPI(title="EmoLink AI Service", version="2.0")
+
+
+class GenerateRequest(BaseModel):
+    family_id: int
+    use_ensemble: bool = True
+
+
+class CrisisCheckRequest(BaseModel):
+    family_id: int
+
+
+class SentimentRequest(BaseModel):
+    journal_entry_id: int
+    entry_text: str
+
+
+class FeedbackRequest(BaseModel):
+    topic_id: int
+    user_id: int
+    feedback_type: str
+    notes: Optional[str] = None
+
+
+class DynamicsRequest(BaseModel):
+    family_id: int
+
+
+class PredictionRequest(BaseModel):
+    family_id: int
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "message": "EmoLink AI Service v2.0 is running.",
+        "features": [
+            "topic_generation",
+            "sentiment_analysis",
+            "crisis_detection",
+            "mood_prediction",
+            "family_dynamics",
+            "topic_feedback",
+            "multi_model_ensemble"
+        ]
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "gemini": "configured" if os.getenv("GEMINI_API_KEY") else "missing",
+        "claude": "configured" if os.getenv("ANTHROPIC_API_KEY") else "missing",
+        "openai": "configured" if os.getenv("OPENAI_API_KEY") else "missing"
+    }
+
+
+@app.post("/generate-topics")
+def generate_topics_endpoint(req: GenerateRequest):
+    family_data = db.get_family_data(req.family_id)
+    if not family_data:
+        return {"status": "error", "message": "Family not found."}
+
+    if not family_data["moods"] and not family_data["journals"]:
+        return {"status": "empty", "message": "Not enough check-ins yet."}
+
+    dynamics = db.get_family_dynamics(req.family_id)
+    prompt = context_builder.build_prompt(
+        family_data,
+        include_dynamics=bool(dynamics),
+        dynamics=dynamics
+    )
+
+    print(f"--- Prompt sent to AI for family_id {req.family_id} ---")
+    print(f"Using ensemble: {req.use_ensemble}\n")
+
+    try:
+        if req.use_ensemble:
+            ai_result = gemini_client.generate_ensemble_topics(
+                prompt,
+                req.family_id,
+                save_vote_func=db.save_model_votes
+            )
+        else:
+            ai_result = gemini_client.generate_topics(prompt)
+
+        db.save_ai_results(req.family_id, ai_result["topics"], ai_result["summary"])
+
+        db.detect_crisis_patterns(req.family_id)
+
+        return {
+            "status": "ok",
+            "topics": [t["topic"] for t in ai_result["topics"]],
+            "topic_details": ai_result["topics"],
+            "summary": ai_result.get("summary", ""),
+            "ensemble_used": ai_result.get("ensemble_used", False),
+            "models_used": ai_result.get("models_used", ["gemini"])
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/detect-crisis")
+def detect_crisis(req: CrisisCheckRequest):
+    family_data = db.get_family_data(req.family_id)
+    if not family_data:
+        return {"status": "error", "message": "Family not found."}
+
+    try:
+        alerts = db.detect_crisis_patterns(req.family_id)
+
+        return {
+            "status": "ok",
+            "alerts_triggered": len(alerts),
+            "alerts": alerts,
+            "has_critical": any(a['severity'] == 'critical' for a in alerts),
+            "has_high": any(a['severity'] == 'high' for a in alerts)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/get-crisis-alerts/{family_id}")
+def get_crisis_alerts(family_id: int):
+    try:
+        alerts = db.get_unresolved_crisis_alerts(family_id)
+        return {
+            "status": "ok",
+            "alerts": alerts,
+            "count": len(alerts)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/resolve-crisis/{alert_id}")
+def resolve_crisis(alert_id: int):
+    try:
+        db.resolve_crisis_alert(alert_id)
+        return {"status": "ok", "message": "Alert resolved"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/analyze-sentiment")
+def analyze_sentiment(req: SentimentRequest):
+    if not req.entry_text:
+        return {"status": "error", "message": "Entry text is required"}
+
+    try:
+        sentiment = gemini_client.analyze_text_sentiment(req.entry_text)
+
+        db.analyze_sentiment(req.journal_entry_id, sentiment)
+
+        crisis_indicators = []
+        if sentiment['anxiety_score'] > 0.7:
+            crisis_indicators.append("High anxiety detected")
+        if sentiment['sentiment_score'] < -0.5:
+            crisis_indicators.append("Strong negative sentiment")
+        if any(k in req.entry_text.lower() for k in ['suicide', 'self harm', 'want to die', 'cutting']):
+            crisis_indicators.append("CRISIS KEYWORD DETECTED - Immediate attention required")
+
+        return {
+            "status": "ok",
+            "sentiment": sentiment,
+            "crisis_indicators": crisis_indicators,
+            "requires_attention": len(crisis_indicators) > 0
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/get-sentiment/{family_id}")
+def get_sentiment(family_id: int):
+    try:
+        sentiment_data = db.get_sentiment_for_journals(family_id)
+        return {
+            "status": "ok",
+            "sentiment_entries": sentiment_data,
+            "count": len(sentiment_data)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/predict-moods")
+def predict_moods(req: PredictionRequest):
+    family_data = db.get_family_data(req.family_id)
+    if not family_data:
+        return {"status": "error", "message": "Family not found."}
+
+    try:
+        predictions = db.predict_next_mood(req.family_id)
+
+        concerning = []
+        for uid, pred in predictions.items():
+            if pred['predicted_mood'] in ['sad', 'anxious'] and pred['confidence'] > 0.7:
+                concerning.append({
+                    "user_name": pred['user_name'],
+                    "predicted_mood": pred['predicted_mood'],
+                    "confidence": pred['confidence'],
+                    "trend": pred['trend']
+                })
+
+        return {
+            "status": "ok",
+            "predictions": list(predictions.values()),
+            "concerning_predictions": concerning,
+            "total_predicted": len(predictions)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/topic-feedback")
+def submit_feedback(req: FeedbackRequest):
+    valid_types = ['discussed', 'skipped', 'helpful', 'not_helpful']
+    if req.feedback_type not in valid_types:
+        return {"status": "error", "message": f"Invalid feedback type. Must be one of: {valid_types}"}
+
+    try:
+        db.save_topic_feedback(
+            req.topic_id,
+            req.user_id,
+            req.feedback_type,
+            req.notes
+        )
+
+        return {
+            "status": "ok",
+            "message": f"Feedback '{req.feedback_type}' recorded",
+            "points_earned": 2 if req.feedback_type == 'discussed' else (1 if req.feedback_type == 'helpful' else 0)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/topic-effectiveness/{family_id}")
+def get_effectiveness(family_id: int):
+    try:
+        effectiveness = db.get_topic_effectiveness(family_id)
+
+        total_topics = len(effectiveness)
+        discussed = sum(1 for t in effectiveness if t['discussed_count'] > 0)
+        helpful = sum(1 for t in effectiveness if t['helpful_count'] > t['not_helpful_count'])
+
+        return {
+            "status": "ok",
+            "effectiveness": effectiveness,
+            "summary": {
+                "total_topics": total_topics,
+                "discussed_count": discussed,
+                "helpful_count": helpful,
+                "discussed_rate": round(discussed / total_topics * 100, 1) if total_topics > 0 else 0,
+                "helpful_rate": round(helpful / total_topics * 100, 1) if total_topics > 0 else 0
+            }
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/analyze-dynamics")
+def analyze_dynamics(req: DynamicsRequest):
+    try:
+        dynamics = db.analyze_family_dynamics(req.family_id)
+
+        return {
+            "status": "ok",
+            "dynamics": dynamics,
+            "insights": generate_dynamics_insights(dynamics)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def generate_dynamics_insights(dynamics: dict) -> List[str]:
+    insights = []
+
+    if not dynamics:
+        return insights
+
+    gap = dynamics.get('communication_gap', 0)
+    if gap > 0.4:
+        insights.append("There's a significant engagement gap between family members. Consider setting aside dedicated one-on-one time with the less-engaged member.")
+    elif gap > 0.2:
+        insights.append("Communication is slightly unbalanced. Encourage more sharing from the quieter family member(s).")
+
+    parent_score = dynamics.get('parent_engagement_score', 0)
+    teen_score = dynamics.get('teen_engagement_score', 0)
+
+    if parent_score > 0.7 and teen_score < 0.3:
+        insights.append("Parents are very engaged but teens are less active. Try more teen-led conversations or activities they enjoy.")
+    elif teen_score > 0.7 and parent_score < 0.3:
+        insights.append("Teens are very engaged but parents could participate more. Show interest in their world.")
+
+    dominant = dynamics.get('dominant_role', 'balanced')
+    if dominant == 'parent_led':
+        insights.append("Family discussions tend to be parent-driven. Create space for teens to lead topics.")
+    elif dominant == 'teen_led':
+        insights.append("Teens are driving conversations. This is great! Consider parents asking more follow-up questions.")
+
+    focus = dynamics.get('suggested_focus_areas', '')
+    if focus:
+        for area in focus.split(';'):
+            area = area.strip()
+            if area:
+                insights.append(f"Focus area: {area}")
+
+    if not insights:
+        insights.append("Family dynamics look healthy! Keep up the positive engagement.")
+
+    return insights
+
+
+@app.get("/get-dynamics/{family_id}")
+def get_dynamics(family_id: int):
+    try:
+        dynamics = db.get_family_dynamics(family_id)
+        if not dynamics:
+            return {"status": "not_found", "message": "No dynamics data yet. Run analyze-dynamics first."}
+        return {"status": "ok", "dynamics": dynamics}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/family-overview/{family_id}")
+def family_overview(family_id: int):
+    try:
+        family_data = db.get_family_data(family_id)
+        if not family_data:
+            return {"status": "error", "message": "Family not found."}
+
+        dynamics = db.get_family_dynamics(family_id)
+        crisis_alerts = db.get_unresolved_crisis_alerts(family_id)
+        predictions = db.predict_next_mood(family_id)
+
+        return {
+            "status": "ok",
+            "family_name": family_data["family_name"],
+            "mood_count": len(family_data["moods"]),
+            "journal_count": len(family_data["journals"]),
+            "dynamics": dynamics,
+            "crisis_alerts": crisis_alerts,
+            "crisis_count": len(crisis_alerts),
+            "predictions": list(predictions.values()) if predictions else [],
+            "recommendations": generate_family_recommendations(
+                family_data, dynamics, crisis_alerts, predictions
+            )
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def generate_family_recommendations(family_data: dict, dynamics: dict, alerts: list, predictions: dict) -> List[str]:
+    recommendations = []
+
+    if any(a['severity'] in ['critical', 'high'] for a in alerts):
+        recommendations.append("CRITICAL: Some crisis alerts need immediate attention.")
+        recommendations.append("Consider reaching out privately to the affected family member.")
+
+    recent_moods = family_data.get("moods", [])
+    if len(recent_moods) < 3:
+        recommendations.append("Add more mood check-ins to get better insights.")
+
+    if dynamics:
+        if dynamics.get('communication_gap', 0) > 0.3:
+            recommendations.append("Try a shared activity to bridge the engagement gap.")
+
+    if predictions:
+        concerning = [
+            p for p in predictions.values()
+            if p.get('predicted_mood') in ['sad', 'anxious'] and p.get('confidence', 0) > 0.7
+        ]
+        if concerning:
+            recommendations.append("Some members may need extra emotional support this week.")
+
+    if not recommendations:
+        recommendations.append("Family is doing well! Keep the positive momentum going.")
+
+    return recommendations
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=int(os.getenv("AI_PORT", 8001)),
+        reload=True
+    )
